@@ -1,54 +1,22 @@
-export interface User {
-  id: string;
-  role: 'admin' | 'operator' | 'viewer';
-  permissions: string[];
+export type Role = 'admin' | 'operator' | 'viewer';
+
+export interface Permission {
+  read: boolean;
+  write: boolean;
+  delete: boolean;
 }
 
-export const ROLES = {
-  admin: {
-    permissions: [
-      'read:all',
-      'write:all',
-      'delete:all',
-      'bulk:import'
-    ]
-  },
-  operator: {
-    permissions: [
-      'read:all',
-      'write:all',
-      'bulk:import'
-    ]
-  },
-  viewer: {
-    permissions: [
-      'read:all'
-    ]
-  }
-} as const;
+export const ROLE_PERMISSIONS: Record<Role, Permission> = {
+  admin: { read: true, write: true, delete: true },
+  operator: { read: true, write: true, delete: false },
+  viewer: { read: true, write: false, delete: false }
+};
 
-export function hasPermission(user: User, permission: string): boolean {
-  return user.permissions.includes(permission);
+export function hasPermission(role: Role, action: 'read' | 'write' | 'delete'): boolean {
+  const permission = ROLE_PERMISSIONS[role];
+  return permission[action];
 }
 
-export function getUserFromEvent(event: any): User {
-  const authHeader = event.headers?.Authorization || event.headers?.authorization;
-  if (!authHeader) {
-    throw new Error('No authorization header');
-  }
-  
-  // Mock user extraction - in real implementation, decode JWT token
-  const mockUser: User = {
-    id: 'user-123',
-    role: 'admin',
-    permissions: ROLES.admin.permissions as string[]
-  };
-  
-  return mockUser;
-}
-
-export function requirePermission(user: User, permission: string): void {
-  if (!hasPermission(user, permission)) {
-    throw new Error(`Insufficient permissions. Required: ${permission}`);
-  }
+export function validateRole(role: string): role is Role {
+  return ['admin', 'operator', 'viewer'].includes(role);
 }
