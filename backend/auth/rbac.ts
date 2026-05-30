@@ -1,45 +1,54 @@
-export type Role = 'admin' | 'operator' | 'viewer';
-
-export interface Permission {
-  resource: string;
-  action: 'create' | 'read' | 'update' | 'delete' | 'bulk';
+export interface User {
+  id: string;
+  role: 'admin' | 'operator' | 'viewer';
+  permissions: string[];
 }
 
-const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
-  admin: [
-    { resource: '*', action: 'create' },
-    { resource: '*', action: 'read' },
-    { resource: '*', action: 'update' },
-    { resource: '*', action: 'delete' },
-    { resource: '*', action: 'bulk' }
-  ],
-  operator: [
-    { resource: '*', action: 'create' },
-    { resource: '*', action: 'read' },
-    { resource: '*', action: 'update' },
-    { resource: '*', action: 'bulk' }
-  ],
-  viewer: [
-    { resource: '*', action: 'read' }
-  ]
-};
+export const ROLES = {
+  admin: {
+    permissions: [
+      'read:all',
+      'write:all',
+      'delete:all',
+      'bulk:import'
+    ]
+  },
+  operator: {
+    permissions: [
+      'read:all',
+      'write:all',
+      'bulk:import'
+    ]
+  },
+  viewer: {
+    permissions: [
+      'read:all'
+    ]
+  }
+} as const;
 
-export function hasPermission(role: Role, resource: string, action: Permission['action']): boolean {
-  const permissions = ROLE_PERMISSIONS[role] || [];
-  return permissions.some(p => 
-    (p.resource === '*' || p.resource === resource) && p.action === action
-  );
+export function hasPermission(user: User, permission: string): boolean {
+  return user.permissions.includes(permission);
 }
 
-export function extractUserRole(event: any): Role {
+export function getUserFromEvent(event: any): User {
   const authHeader = event.headers?.Authorization || event.headers?.authorization;
-  if (!authHeader) return 'viewer';
+  if (!authHeader) {
+    throw new Error('No authorization header');
+  }
   
-  try {
-    const token = authHeader.replace('Bearer ', '');
-    const payload = JSON.parse(Buffer.from(token.split('.')[1], 'base64').toString());
-    return payload.role || 'viewer';
-  } catch {
-    return 'viewer';
+  // Mock user extraction - in real implementation, decode JWT token
+  const mockUser: User = {
+    id: 'user-123',
+    role: 'admin',
+    permissions: ROLES.admin.permissions as string[]
+  };
+  
+  return mockUser;
+}
+
+export function requirePermission(user: User, permission: string): void {
+  if (!hasPermission(user, permission)) {
+    throw new Error(`Insufficient permissions. Required: ${permission}`);
   }
 }
