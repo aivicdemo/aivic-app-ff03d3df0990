@@ -1,151 +1,141 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, ScanCommand, GetCommand, PutCommand, DeleteCommand, BatchWriteCommand } from '@aws-sdk/lib-dynamodb';
-import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { hasPermission, validateRole, Role } from './rbac';
-import * as crypto from 'crypto';
+import { DynamoDBDocumentClient, ScanCommand, GetCommand, PutCommand, UpdateCommand, DeleteCommand, BatchWriteCommand } from '@aws-sdk/lib-dynamodb';
+import { hasPermission, extractUserFromEvent, User } from './rbac';
+import { randomUUID } from 'crypto';
 
 const client = new DynamoDBClient({});
 const docClient = DynamoDBDocumentClient.from(client);
 const TABLE_NAME = process.env.MAIN_TABLE!;
 
-interface AuthContext {
-  userId: string;
-  role: Role;
+interface APIGatewayEvent {
+  httpMethod: string;
+  path: string;
+  pathParameters?: { [key: string]: string };
+  queryStringParameters?: { [key: string]: string };
+  body?: string;
+  headers: { [key: string]: string };
 }
 
-function extractAuth(event: APIGatewayProxyEvent): AuthContext {
-  const userId = event.headers['x-user-id'] || 'system';
-  const role = event.headers['x-user-role'] || 'viewer';
-  
-  if (!validateRole(role)) {
-    throw new Error('Invalid role');
-  }
-  
-  return { userId, role };
+interface APIGatewayResponse {
+  statusCode: number;
+  headers: { [key: string]: string };
+  body: string;
 }
 
-function createResponse(statusCode: number, body: any): APIGatewayProxyResult {
+const TABLE_CONFIGS = {
+  '0': { name: 'LoginUser', pk: 'USER' },
+  '1': { name: 'Store', pk: 'STORE' },
+  '2': { name: 'SalesData', pk: 'SALES' },
+  '3': { name: 'OperationHistory', pk: 'OPERATION' },
+  '4': { name: 'LocationData', pk: 'LOCATION' },
+  '5': { name: 'MarketAnalysisResult', pk: 'MARKET_ANALYSIS' },
+  '6': { name: 'CompetitorSurveyData', pk: 'COMPETITOR_SURVEY' },
+  '7': { name: 'CandidateLocation', pk: 'CANDIDATE' },
+  '8': { name: 'PopulationStatistics', pk: 'POPULATION' },
+  '9': { name: 'ConsumerAttribute', pk: 'CONSUMER' },
+  '10': { name: 'MarketSizeResult', pk: 'MARKET_SIZE' },
+  '11': { name: 'CompetitorSalon', pk: 'COMPETITOR_SALON' },
+  '12': { name: 'AnalysisReport', pk: 'REPORT' },
+  '13': { name: 'DataCollectionHistory', pk: 'DATA_COLLECTION' }
+};
+
+function createResponse(statusCode: number, body: any): APIGatewayResponse {
   return {
     statusCode,
     headers: {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, x-user-id, x-user-role'
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
     },
     body: JSON.stringify(body)
   };
 }
 
-async function createAuditLog(userId: string, action: string, details: any) {
-  const auditItem = {
+async function createAuditLog(user: User, action: string, resource: string, details: any) {
+  const auditLog = {
     pk: 'AUDIT',
-    sk: `${Date.now()}_${crypto.randomUUID()}`,
-    userId,
+    sk: `${Date.now()}_${randomUUID()}`,
+    userId: user.id,
     action,
+    resource,
     details: JSON.stringify(details),
-    timestamp: new Date().toISOString()
+    timestamp: new Date().toISOString(),
+    createdAt: new Date().toISOString()
   };
   
   await docClient.send(new PutCommand({
     TableName: TABLE_NAME,
-    Item: auditItem
+    Item: auditLog
   }));
 }
 
-const TABLE_CONFIGS = {
-  'login-users': { pk: 'LOGIN_USER', name: 'ログインユーザー' },
-  'stores': { pk: 'STORE', name: '店舗' },
-  'sales-data': { pk: 'SALES_DATA', name: '売上データ' },
-  'operation-history': { pk: 'OPERATION_HISTORY', name: '操作履歴' },
-  'location-data': { pk: 'LOCATION_DATA', name: '立地データ' },
-  'trade-area-analysis': { pk: 'TRADE_AREA_ANALYSIS', name: '商圏分析結果' },
-  'competitor-research': { pk: 'COMPETITOR_RESEARCH', name: '競合調査データ' },
-  'candidate-locations': { pk: 'CANDIDATE_LOCATION', name: '候補地' },
-  'demographic-data': { pk: 'DEMOGRAPHIC_DATA', name: '人口統計データ' },
-  'consumer-attributes': { pk: 'CONSUMER_ATTRIBUTES', name: '消費者属性情報' },
-  'market-size-results': { pk: 'MARKET_SIZE_RESULT', name: '市場規模算出結果' },
-  'competitor-salons': { pk: 'COMPETITOR_SALON', name: '競合サロン' },
-  'analysis-reports': { pk: 'ANALYSIS_REPORT', name: '分析レポート' },
-  'data-collection-history': { pk: 'DATA_COLLECTION_HISTORY', name: 'データ収集履歴' }
-};
+function validateTableIndex(tableIndex: string): boolean {
+  return tableIndex in TABLE_CONFIGS;
+}
 
-export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
+function addTimestamps(item: any, isUpdate = false): any {
+  const now = new Date().toISOString();
+  const result = { ...item };
+  
+  if (!isUpdate) {
+    result.createdAt = now;
+  }
+  result.updatedAt = now;
+  
+  return result;
+}
+
+export const handler = async (event: APIGatewayEvent): Promise<APIGatewayResponse> => {
   try {
     if (event.httpMethod === 'OPTIONS') {
       return createResponse(200, {});
     }
 
-    const auth = extractAuth(event);
+    let user: User;
+    try {
+      user = extractUserFromEvent(event);
+    } catch (error) {
+      return createResponse(401, { error: 'Unauthorized' });
+    }
+
     const path = event.path;
     const method = event.httpMethod;
-
+    
+    // Handle /resources endpoint
     if (path === '/resources' && method === 'GET') {
-      if (!hasPermission(auth.role, 'read')) {
-        return createResponse(403, { error: 'Insufficient permissions' });
+      if (!hasPermission(user, 'resources', 'read')) {
+        return createResponse(403, { error: 'Forbidden' });
       }
-
-      const resources = Object.entries(TABLE_CONFIGS).map(([key, config]) => ({
-        id: key,
+      
+      const resources = Object.entries(TABLE_CONFIGS).map(([index, config]) => ({
+        index,
         name: config.name,
         pk: config.pk
       }));
-
+      
       return createResponse(200, { resources });
     }
 
-    const pathMatch = path.match(/^\/api\/([^/]+)(?:\/([^/]+))?$/);
+    // Parse table-specific endpoints
+    const pathMatch = path.match(/^\/api\/(\d+)(?:\/(\w+))?(?:\/(\w+))?$/);
     if (!pathMatch) {
       return createResponse(404, { error: 'Not found' });
     }
 
-    const [, tableKey, itemId] = pathMatch;
-    const tableConfig = TABLE_CONFIGS[tableKey as keyof typeof TABLE_CONFIGS];
+    const [, tableIndex, action, id] = pathMatch;
     
-    if (!tableConfig) {
-      return createResponse(404, { error: 'Table not found' });
+    if (!validateTableIndex(tableIndex)) {
+      return createResponse(400, { error: 'Invalid table index' });
     }
 
-    const { pk } = tableConfig;
+    const tableConfig = TABLE_CONFIGS[tableIndex as keyof typeof TABLE_CONFIGS];
+    const resource = tableConfig.name;
 
-    if (method === 'GET' && !itemId) {
-      if (!hasPermission(auth.role, 'read')) {
-        return createResponse(403, { error: 'Insufficient permissions' });
-      }
-
-      const command = new ScanCommand({
-        TableName: TABLE_NAME,
-        FilterExpression: 'pk = :pk',
-        ExpressionAttributeValues: {
-          ':pk': pk
-        }
-      });
-
-      const result = await docClient.send(command);
-      return createResponse(200, { items: result.Items || [] });
-    }
-
-    if (method === 'GET' && itemId) {
-      if (!hasPermission(auth.role, 'read')) {
-        return createResponse(403, { error: 'Insufficient permissions' });
-      }
-
-      const command = new GetCommand({
-        TableName: TABLE_NAME,
-        Key: { pk, sk: itemId }
-      });
-
-      const result = await docClient.send(command);
-      if (!result.Item) {
-        return createResponse(404, { error: 'Item not found' });
-      }
-
-      return createResponse(200, result.Item);
-    }
-
-    if (method === 'POST' && path.endsWith('/bulk')) {
-      if (!hasPermission(auth.role, 'write')) {
-        return createResponse(403, { error: 'Insufficient permissions' });
+    // Handle bulk import endpoint
+    if (action === 'bulk' && method === 'POST') {
+      if (!hasPermission(user, resource, 'bulk')) {
+        return createResponse(403, { error: 'Forbidden' });
       }
 
       const body = JSON.parse(event.body || '{}');
@@ -158,28 +148,29 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       let imported = 0;
       let failed = 0;
       const errors: string[] = [];
-      const now = new Date().toISOString();
 
+      // Process items in batches of 25 (DynamoDB limit)
       for (let i = 0; i < items.length; i += 25) {
         const batch = items.slice(i, i + 25);
-        const writeRequests = batch.map(item => ({
-          PutRequest: {
-            Item: {
-              ...item,
-              pk,
-              sk: item.id || crypto.randomUUID(),
-              createdAt: now,
-              updatedAt: now,
-              createdBy: auth.userId,
-              updatedBy: auth.userId
+        const putRequests = batch.map(item => {
+          const processedItem = addTimestamps({
+            ...item,
+            pk: tableConfig.pk,
+            sk: item.id || randomUUID(),
+            id: item.id || randomUUID()
+          });
+          
+          return {
+            PutRequest: {
+              Item: processedItem
             }
-          }
-        }));
+          };
+        });
 
         try {
           await docClient.send(new BatchWriteCommand({
             RequestItems: {
-              [TABLE_NAME]: writeRequests
+              [TABLE_NAME]: putRequests
             }
           }));
           imported += batch.length;
@@ -189,102 +180,121 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
         }
       }
 
-      await createAuditLog(auth.userId, 'BULK_IMPORT', {
-        table: tableKey,
+      await createAuditLog(user, 'BULK_IMPORT', resource, {
         imported,
         failed,
-        total: items.length
+        totalItems: items.length
       });
 
       return createResponse(200, { imported, failed, errors });
     }
 
-    if (method === 'POST') {
-      if (!hasPermission(auth.role, 'write')) {
-        return createResponse(403, { error: 'Insufficient permissions' });
-      }
+    // Handle CRUD operations
+    switch (method) {
+      case 'GET':
+        if (!hasPermission(user, resource, 'read')) {
+          return createResponse(403, { error: 'Forbidden' });
+        }
 
-      const body = JSON.parse(event.body || '{}');
-      const now = new Date().toISOString();
-      const id = body.id || crypto.randomUUID();
+        if (id) {
+          // Get single item
+          const result = await docClient.send(new GetCommand({
+            TableName: TABLE_NAME,
+            Key: { pk: tableConfig.pk, sk: id }
+          }));
+          
+          if (!result.Item) {
+            return createResponse(404, { error: 'Item not found' });
+          }
+          
+          return createResponse(200, result.Item);
+        } else {
+          // List items
+          const result = await docClient.send(new ScanCommand({
+            TableName: TABLE_NAME,
+            FilterExpression: 'pk = :pk',
+            ExpressionAttributeValues: {
+              ':pk': tableConfig.pk
+            }
+          }));
+          
+          return createResponse(200, { items: result.Items || [] });
+        }
 
-      const item = {
-        ...body,
-        pk,
-        sk: id,
-        createdAt: now,
-        updatedAt: now,
-        createdBy: auth.userId,
-        updatedBy: auth.userId
-      };
+      case 'POST':
+        if (!hasPermission(user, resource, 'create')) {
+          return createResponse(403, { error: 'Forbidden' });
+        }
 
-      const command = new PutCommand({
-        TableName: TABLE_NAME,
-        Item: item
-      });
+        const createBody = JSON.parse(event.body || '{}');
+        const newItem = addTimestamps({
+          ...createBody,
+          pk: tableConfig.pk,
+          sk: createBody.id || randomUUID(),
+          id: createBody.id || randomUUID(),
+          createdBy: user.id,
+          updatedBy: user.id
+        });
 
-      await docClient.send(command);
-      await createAuditLog(auth.userId, 'CREATE', { table: tableKey, id });
+        await docClient.send(new PutCommand({
+          TableName: TABLE_NAME,
+          Item: newItem
+        }));
 
-      return createResponse(201, item);
+        await createAuditLog(user, 'CREATE', resource, { id: newItem.id });
+        
+        return createResponse(201, newItem);
+
+      case 'PUT':
+        if (!id) {
+          return createResponse(400, { error: 'ID required for update' });
+        }
+        
+        if (!hasPermission(user, resource, 'update')) {
+          return createResponse(403, { error: 'Forbidden' });
+        }
+
+        const updateBody = JSON.parse(event.body || '{}');
+        const updatedItem = addTimestamps({
+          ...updateBody,
+          pk: tableConfig.pk,
+          sk: id,
+          id: id,
+          updatedBy: user.id
+        }, true);
+
+        await docClient.send(new PutCommand({
+          TableName: TABLE_NAME,
+          Item: updatedItem
+        }));
+
+        await createAuditLog(user, 'UPDATE', resource, { id });
+        
+        return createResponse(200, updatedItem);
+
+      case 'DELETE':
+        if (!id) {
+          return createResponse(400, { error: 'ID required for delete' });
+        }
+        
+        if (!hasPermission(user, resource, 'delete')) {
+          return createResponse(403, { error: 'Forbidden' });
+        }
+
+        await docClient.send(new DeleteCommand({
+          TableName: TABLE_NAME,
+          Key: { pk: tableConfig.pk, sk: id }
+        }));
+
+        await createAuditLog(user, 'DELETE', resource, { id });
+        
+        return createResponse(200, { message: 'Item deleted successfully' });
+
+      default:
+        return createResponse(405, { error: 'Method not allowed' });
     }
-
-    if (method === 'PUT' && itemId) {
-      if (!hasPermission(auth.role, 'write')) {
-        return createResponse(403, { error: 'Insufficient permissions' });
-      }
-
-      const body = JSON.parse(event.body || '{}');
-      const now = new Date().toISOString();
-
-      const item = {
-        ...body,
-        pk,
-        sk: itemId,
-        updatedAt: now,
-        updatedBy: auth.userId
-      };
-
-      const command = new PutCommand({
-        TableName: TABLE_NAME,
-        Item: item
-      });
-
-      await docClient.send(command);
-      await createAuditLog(auth.userId, 'UPDATE', { table: tableKey, id: itemId });
-
-      return createResponse(200, item);
-    }
-
-    if (method === 'DELETE' && itemId) {
-      if (!hasPermission(auth.role, 'delete')) {
-        return createResponse(403, { error: 'Insufficient permissions' });
-      }
-
-      const command = new DeleteCommand({
-        TableName: TABLE_NAME,
-        Key: { pk, sk: itemId }
-      });
-
-      await docClient.send(command);
-      await createAuditLog(auth.userId, 'DELETE', { table: tableKey, id: itemId });
-
-      return createResponse(200, { message: 'Item deleted successfully' });
-    }
-
-    return createResponse(405, { error: 'Method not allowed' });
-
   } catch (error) {
     console.error('Error:', error);
-    
-    if (error instanceof SyntaxError) {
-      return createResponse(400, { error: 'Invalid JSON in request body' });
-    }
-    
-    if (error instanceof Error && error.message === 'Invalid role') {
-      return createResponse(403, { error: 'Invalid role' });
-    }
-    
     return createResponse(500, { error: 'Internal server error' });
   }
 };
