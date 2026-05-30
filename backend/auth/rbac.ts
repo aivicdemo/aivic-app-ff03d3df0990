@@ -13,8 +13,8 @@ export const ROLE_PERMISSIONS: Record<Role, Permission> = {
 };
 
 export function hasPermission(role: Role, action: 'read' | 'write' | 'delete'): boolean {
-  const permission = ROLE_PERMISSIONS[role];
-  return permission[action];
+  const permissions = ROLE_PERMISSIONS[role];
+  return permissions[action];
 }
 
 export function validateRole(role: string): role is Role {
