@@ -1,45 +1,50 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, ScanCommand, GetCommand, PutCommand, UpdateCommand, DeleteCommand, BatchWriteCommand } from '@aws-sdk/lib-dynamodb';
-import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { hasPermission, validateRole, Role } from './rbac';
-import * as crypto from 'crypto';
+import { hasPermission, extractUserRole, Role } from './rbac';
+import { randomUUID } from 'crypto';
 
 const client = new DynamoDBClient({});
 const docClient = DynamoDBDocumentClient.from(client);
 const TABLE_NAME = process.env.MAIN_TABLE!;
 
-interface AuthContext {
-  userId: string;
-  role: Role;
+interface APIGatewayProxyEvent {
+  httpMethod: string;
+  path: string;
+  pathParameters?: { [key: string]: string } | null;
+  queryStringParameters?: { [key: string]: string } | null;
+  body?: string | null;
+  headers: { [key: string]: string };
+  requestContext: {
+    requestId: string;
+    identity: {
+      sourceIp: string;
+      userAgent?: string;
+    };
+  };
 }
 
-const TABLE_CONFIGS = {
-  '0': { pk: 'LOGIN_USER', name: 'ログインユーザー' },
-  '1': { pk: 'STORE', name: '店舗' },
-  '2': { pk: 'SALES_DATA', name: '売上データ' },
-  '3': { pk: 'OPERATION_HISTORY', name: '操作履歴' },
-  '4': { pk: 'LOCATION_DATA', name: '立地データ' },
-  '5': { pk: 'TRADE_AREA_ANALYSIS', name: '商圏分析結果' },
-  '6': { pk: 'COMPETITOR_SURVEY', name: '競合調査データ' },
-  '7': { pk: 'CANDIDATE_LOCATION', name: '候補地' },
-  '8': { pk: 'POPULATION_STATS', name: '人口統計データ' },
-  '9': { pk: 'CONSUMER_ATTRIBUTES', name: '消費者属性情報' },
-  '10': { pk: 'MARKET_SIZE_RESULT', name: '市場規模算出結果' },
-  '11': { pk: 'COMPETITOR_SALON', name: '競合サロン' },
-  '12': { pk: 'ANALYSIS_REPORT', name: '分析レポート' },
-  '13': { pk: 'DATA_COLLECTION_HISTORY', name: 'データ収集履歴' }
-};
-
-function getAuthContext(event: APIGatewayProxyEvent): AuthContext {
-  const userId = event.headers['x-user-id'] || 'system';
-  const role = event.headers['x-user-role'] || 'viewer';
-  
-  if (!validateRole(role)) {
-    throw new Error('Invalid role');
-  }
-  
-  return { userId, role };
+interface APIGatewayProxyResult {
+  statusCode: number;
+  headers?: { [key: string]: string };
+  body: string;
 }
+
+const TABLES = [
+  'login_users',
+  'stores', 
+  'sales_data',
+  'operation_history',
+  'location_data',
+  'trade_area_analysis',
+  'competitor_research',
+  'candidate_locations',
+  'demographic_data',
+  'consumer_attributes',
+  'market_size_results',
+  'competitor_salons',
+  'analysis_reports',
+  'data_collection_history'
+];
 
 function createResponse(statusCode: number, body: any): APIGatewayProxyResult {
   return {
@@ -48,301 +53,352 @@ function createResponse(statusCode: number, body: any): APIGatewayProxyResult {
       'Content-Type': 'application/json',
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type, x-user-id, x-user-role'
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization'
     },
     body: JSON.stringify(body)
   };
 }
 
-async function createAuditLog(userId: string, action: string, details: any) {
-  const auditLog = {
-    pk: 'AUDIT',
-    sk: `${Date.now()}_${crypto.randomUUID()}`,
-    userId,
-    action,
-    details,
-    timestamp: new Date().toISOString()
-  };
-  
-  await docClient.send(new PutCommand({
-    TableName: TABLE_NAME,
-    Item: auditLog
-  }));
+function validateTableIndex(tableIndex: string): string | null {
+  const index = parseInt(tableIndex);
+  if (isNaN(index) || index < 0 || index >= TABLES.length) {
+    return null;
+  }
+  return TABLES[index];
 }
 
-function addTimestamps(item: any, userId: string, isUpdate = false) {
+async function createAuditLog(event: APIGatewayProxyEvent, action: string, details: any) {
+  try {
+    const auditItem = {
+      pk: 'AUDIT',
+      sk: `${Date.now()}_${randomUUID()}`,
+      action,
+      details: JSON.stringify(details),
+      ip: event.requestContext.identity.sourceIp,
+      userAgent: event.requestContext.identity.userAgent || '',
+      timestamp: new Date().toISOString(),
+      requestId: event.requestContext.requestId
+    };
+    
+    await docClient.send(new PutCommand({
+      TableName: TABLE_NAME,
+      Item: auditItem
+    }));
+  } catch (error) {
+    console.error('Failed to create audit log:', error);
+  }
+}
+
+function addTimestamps(item: any, isUpdate = false): any {
   const now = new Date().toISOString();
-  
   if (!isUpdate) {
     item.createdAt = now;
-    item.createdBy = userId;
   }
-  
   item.updatedAt = now;
-  item.updatedBy = userId;
-  
   return item;
+}
+
+function generateId(): string {
+  return randomUUID();
+}
+
+async function handleBulkImport(event: APIGatewayProxyEvent, tableName: string, userRole: Role): Promise<APIGatewayProxyResult> {
+  if (!hasPermission(userRole, tableName, 'bulk')) {
+    return createResponse(403, { error: 'Insufficient permissions for bulk import' });
+  }
+
+  if (!event.body) {
+    return createResponse(400, { error: 'Request body is required' });
+  }
+
+  let requestBody: { items: Record<string, unknown>[] };
+  try {
+    requestBody = JSON.parse(event.body);
+  } catch {
+    return createResponse(400, { error: 'Invalid JSON in request body' });
+  }
+
+  if (!requestBody.items || !Array.isArray(requestBody.items)) {
+    return createResponse(400, { error: 'items array is required' });
+  }
+
+  const items = requestBody.items.map(item => {
+    const processedItem = { ...item };
+    if (!processedItem.id) {
+      processedItem.id = generateId();
+    }
+    processedItem.pk = tableName;
+    processedItem.sk = processedItem.id;
+    return addTimestamps(processedItem);
+  });
+
+  let imported = 0;
+  let failed = 0;
+  const errors: string[] = [];
+
+  // Process in batches of 25 (DynamoDB BatchWrite limit)
+  for (let i = 0; i < items.length; i += 25) {
+    const batch = items.slice(i, i + 25);
+    const putRequests = batch.map(item => ({
+      PutRequest: { Item: item }
+    }));
+
+    try {
+      await docClient.send(new BatchWriteCommand({
+        RequestItems: {
+          [TABLE_NAME]: putRequests
+        }
+      }));
+      imported += batch.length;
+    } catch (error) {
+      failed += batch.length;
+      errors.push(`Batch ${Math.floor(i / 25) + 1}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+    }
+  }
+
+  await createAuditLog(event, 'BULK_IMPORT', {
+    tableName,
+    imported,
+    failed,
+    totalItems: items.length
+  });
+
+  return createResponse(200, { imported, failed, errors });
 }
 
 export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
   try {
-    if (event.httpMethod === 'OPTIONS') {
+    const userRole = extractUserRole(event);
+    const method = event.httpMethod;
+    const path = event.path;
+
+    // Handle OPTIONS for CORS
+    if (method === 'OPTIONS') {
       return createResponse(200, {});
     }
 
-    const auth = getAuthContext(event);
-    const path = event.path;
-    const method = event.httpMethod;
-    
-    // GET /resources エンドポイント
+    // Handle /resources endpoint
     if (path === '/resources' && method === 'GET') {
-      if (!hasPermission(auth.role, 'read')) {
+      if (!hasPermission(userRole, 'resources', 'read')) {
         return createResponse(403, { error: 'Insufficient permissions' });
       }
-      
-      const resources = Object.entries(TABLE_CONFIGS).map(([index, config]) => ({
-        index,
-        pk: config.pk,
-        name: config.name
-      }));
-      
-      return createResponse(200, { resources });
+
+      try {
+        const result = await docClient.send(new ScanCommand({
+          TableName: TABLE_NAME,
+          FilterExpression: 'pk <> :auditPk',
+          ExpressionAttributeValues: {
+            ':auditPk': 'AUDIT'
+          }
+        }));
+
+        const groupedData: Record<string, any[]> = {};
+        TABLES.forEach(table => {
+          groupedData[table] = [];
+        });
+
+        result.Items?.forEach(item => {
+          if (item.pk && TABLES.includes(item.pk)) {
+            groupedData[item.pk].push(item);
+          }
+        });
+
+        return createResponse(200, {
+          tables: TABLES,
+          data: groupedData,
+          total: result.Items?.length || 0
+        });
+      } catch (error) {
+        console.error('Error fetching resources:', error);
+        return createResponse(500, { error: 'Internal server error' });
+      }
     }
-    
-    // テーブル操作エンドポイント
-    const tableMatch = path.match(/^\/api\/(\d+)(?:\/(\w+))?(?:\/(\w+))?$/);
-    if (!tableMatch) {
+
+    // Parse table-specific routes
+    const pathMatch = path.match(/^\/api\/(\d+)(?:\/(\w+))?(?:\/(bulk))?$/);
+    if (!pathMatch) {
       return createResponse(404, { error: 'Endpoint not found' });
     }
+
+    const [, tableIndexStr, itemId, bulkFlag] = pathMatch;
+    const tableName = validateTableIndex(tableIndexStr);
     
-    const [, tableIndex, operation, itemId] = tableMatch;
-    const tableConfig = TABLE_CONFIGS[tableIndex as keyof typeof TABLE_CONFIGS];
-    
-    if (!tableConfig) {
-      return createResponse(404, { error: 'Table not found' });
+    if (!tableName) {
+      return createResponse(400, { error: 'Invalid table index' });
     }
-    
-    // 一括インポートエンドポイント
-    if (operation === 'bulk' && method === 'POST') {
-      if (!hasPermission(auth.role, 'write')) {
-        return createResponse(403, { error: 'Insufficient permissions' });
-      }
-      
-      const body = JSON.parse(event.body || '{}');
-      const items = body.items || [];
-      
-      if (!Array.isArray(items)) {
-        return createResponse(400, { error: 'Items must be an array' });
-      }
-      
-      let imported = 0;
-      let failed = 0;
-      const errors: string[] = [];
-      
-      // 25件ずつに分割してバッチ処理
-      for (let i = 0; i < items.length; i += 25) {
-        const batch = items.slice(i, i + 25);
-        const writeRequests = batch.map(item => {
-          const processedItem = {
-            ...item,
-            pk: tableConfig.pk,
-            sk: item.id || crypto.randomUUID(),
-            id: item.id || crypto.randomUUID()
-          };
-          
-          addTimestamps(processedItem, auth.userId);
-          
-          return {
-            PutRequest: {
-              Item: processedItem
+
+    // Handle bulk import
+    if (bulkFlag === 'bulk' && method === 'POST') {
+      return handleBulkImport(event, tableName, userRole);
+    }
+
+    // Handle CRUD operations
+    switch (method) {
+      case 'GET':
+        if (!hasPermission(userRole, tableName, 'read')) {
+          return createResponse(403, { error: 'Insufficient permissions' });
+        }
+
+        if (itemId) {
+          // Get single item
+          try {
+            const result = await docClient.send(new GetCommand({
+              TableName: TABLE_NAME,
+              Key: { pk: tableName, sk: itemId }
+            }));
+
+            if (!result.Item) {
+              return createResponse(404, { error: 'Item not found' });
             }
-          };
-        });
-        
+
+            return createResponse(200, result.Item);
+          } catch (error) {
+            console.error('Error getting item:', error);
+            return createResponse(500, { error: 'Internal server error' });
+          }
+        } else {
+          // Get all items for table
+          try {
+            const result = await docClient.send(new ScanCommand({
+              TableName: TABLE_NAME,
+              FilterExpression: 'pk = :pk',
+              ExpressionAttributeValues: {
+                ':pk': tableName
+              }
+            }));
+
+            return createResponse(200, {
+              items: result.Items || [],
+              count: result.Items?.length || 0
+            });
+          } catch (error) {
+            console.error('Error scanning table:', error);
+            return createResponse(500, { error: 'Internal server error' });
+          }
+        }
+
+      case 'POST':
+        if (!hasPermission(userRole, tableName, 'create')) {
+          return createResponse(403, { error: 'Insufficient permissions' });
+        }
+
+        if (!event.body) {
+          return createResponse(400, { error: 'Request body is required' });
+        }
+
         try {
-          await docClient.send(new BatchWriteCommand({
-            RequestItems: {
-              [TABLE_NAME]: writeRequests
-            }
+          const item = JSON.parse(event.body);
+          const id = item.id || generateId();
+          
+          const newItem = {
+            ...item,
+            pk: tableName,
+            sk: id,
+            id
+          };
+          
+          addTimestamps(newItem);
+
+          await docClient.send(new PutCommand({
+            TableName: TABLE_NAME,
+            Item: newItem
           }));
-          imported += batch.length;
+
+          await createAuditLog(event, 'CREATE', { tableName, itemId: id });
+
+          return createResponse(201, newItem);
         } catch (error) {
-          failed += batch.length;
-          errors.push(`Batch ${Math.floor(i/25) + 1}: ${error instanceof Error ? error.message : 'Unknown error'}`);
+          console.error('Error creating item:', error);
+          return createResponse(500, { error: 'Internal server error' });
         }
-      }
-      
-      await createAuditLog(auth.userId, 'BULK_IMPORT', {
-        table: tableConfig.name,
-        imported,
-        failed,
-        total: items.length
-      });
-      
-      return createResponse(200, { imported, failed, errors });
-    }
-    
-    // 一覧取得
-    if (!operation && method === 'GET') {
-      if (!hasPermission(auth.role, 'read')) {
-        return createResponse(403, { error: 'Insufficient permissions' });
-      }
-      
-      const command = new ScanCommand({
-        TableName: TABLE_NAME,
-        FilterExpression: 'pk = :pk',
-        ExpressionAttributeValues: {
-          ':pk': tableConfig.pk
+
+      case 'PUT':
+        if (!itemId) {
+          return createResponse(400, { error: 'Item ID is required for updates' });
         }
-      });
-      
-      const result = await docClient.send(command);
-      return createResponse(200, { items: result.Items || [] });
-    }
-    
-    // 詳細取得
-    if (itemId && method === 'GET') {
-      if (!hasPermission(auth.role, 'read')) {
-        return createResponse(403, { error: 'Insufficient permissions' });
-      }
-      
-      const command = new GetCommand({
-        TableName: TABLE_NAME,
-        Key: {
-          pk: tableConfig.pk,
-          sk: itemId
+
+        if (!hasPermission(userRole, tableName, 'update')) {
+          return createResponse(403, { error: 'Insufficient permissions' });
         }
-      });
-      
-      const result = await docClient.send(command);
-      
-      if (!result.Item) {
-        return createResponse(404, { error: 'Item not found' });
-      }
-      
-      return createResponse(200, result.Item);
-    }
-    
-    // 新規作成
-    if (!itemId && method === 'POST') {
-      if (!hasPermission(auth.role, 'write')) {
-        return createResponse(403, { error: 'Insufficient permissions' });
-      }
-      
-      const body = JSON.parse(event.body || '{}');
-      const id = crypto.randomUUID();
-      
-      const item = {
-        ...body,
-        pk: tableConfig.pk,
-        sk: id,
-        id
-      };
-      
-      addTimestamps(item, auth.userId);
-      
-      const command = new PutCommand({
-        TableName: TABLE_NAME,
-        Item: item
-      });
-      
-      await docClient.send(command);
-      await createAuditLog(auth.userId, 'CREATE', { table: tableConfig.name, id });
-      
-      return createResponse(201, item);
-    }
-    
-    // 更新
-    if (itemId && method === 'PUT') {
-      if (!hasPermission(auth.role, 'write')) {
-        return createResponse(403, { error: 'Insufficient permissions' });
-      }
-      
-      const body = JSON.parse(event.body || '{}');
-      
-      // 既存アイテムの確認
-      const getCommand = new GetCommand({
-        TableName: TABLE_NAME,
-        Key: {
-          pk: tableConfig.pk,
-          sk: itemId
+
+        if (!event.body) {
+          return createResponse(400, { error: 'Request body is required' });
         }
-      });
-      
-      const existingResult = await docClient.send(getCommand);
-      
-      if (!existingResult.Item) {
-        return createResponse(404, { error: 'Item not found' });
-      }
-      
-      const updatedItem = {
-        ...existingResult.Item,
-        ...body,
-        pk: tableConfig.pk,
-        sk: itemId,
-        id: itemId
-      };
-      
-      addTimestamps(updatedItem, auth.userId, true);
-      
-      const putCommand = new PutCommand({
-        TableName: TABLE_NAME,
-        Item: updatedItem
-      });
-      
-      await docClient.send(putCommand);
-      await createAuditLog(auth.userId, 'UPDATE', { table: tableConfig.name, id: itemId });
-      
-      return createResponse(200, updatedItem);
-    }
-    
-    // 削除
-    if (itemId && method === 'DELETE') {
-      if (!hasPermission(auth.role, 'delete')) {
-        return createResponse(403, { error: 'Insufficient permissions' });
-      }
-      
-      // 既存アイテムの確認
-      const getCommand = new GetCommand({
-        TableName: TABLE_NAME,
-        Key: {
-          pk: tableConfig.pk,
-          sk: itemId
+
+        try {
+          const updates = JSON.parse(event.body);
+          
+          // Check if item exists
+          const existing = await docClient.send(new GetCommand({
+            TableName: TABLE_NAME,
+            Key: { pk: tableName, sk: itemId }
+          }));
+
+          if (!existing.Item) {
+            return createResponse(404, { error: 'Item not found' });
+          }
+
+          const updatedItem = {
+            ...existing.Item,
+            ...updates,
+            pk: tableName,
+            sk: itemId,
+            id: itemId
+          };
+          
+          addTimestamps(updatedItem, true);
+
+          await docClient.send(new PutCommand({
+            TableName: TABLE_NAME,
+            Item: updatedItem
+          }));
+
+          await createAuditLog(event, 'UPDATE', { tableName, itemId });
+
+          return createResponse(200, updatedItem);
+        } catch (error) {
+          console.error('Error updating item:', error);
+          return createResponse(500, { error: 'Internal server error' });
         }
-      });
-      
-      const existingResult = await docClient.send(getCommand);
-      
-      if (!existingResult.Item) {
-        return createResponse(404, { error: 'Item not found' });
-      }
-      
-      const deleteCommand = new DeleteCommand({
-        TableName: TABLE_NAME,
-        Key: {
-          pk: tableConfig.pk,
-          sk: itemId
+
+      case 'DELETE':
+        if (!itemId) {
+          return createResponse(400, { error: 'Item ID is required for deletion' });
         }
-      });
-      
-      await docClient.send(deleteCommand);
-      await createAuditLog(auth.userId, 'DELETE', { table: tableConfig.name, id: itemId });
-      
-      return createResponse(200, { message: 'Item deleted successfully' });
+
+        if (!hasPermission(userRole, tableName, 'delete')) {
+          return createResponse(403, { error: 'Insufficient permissions' });
+        }
+
+        try {
+          // Check if item exists
+          const existing = await docClient.send(new GetCommand({
+            TableName: TABLE_NAME,
+            Key: { pk: tableName, sk: itemId }
+          }));
+
+          if (!existing.Item) {
+            return createResponse(404, { error: 'Item not found' });
+          }
+
+          await docClient.send(new DeleteCommand({
+            TableName: TABLE_NAME,
+            Key: { pk: tableName, sk: itemId }
+          }));
+
+          await createAuditLog(event, 'DELETE', { tableName, itemId });
+
+          return createResponse(200, { message: 'Item deleted successfully' });
+        } catch (error) {
+          console.error('Error deleting item:', error);
+          return createResponse(500, { error: 'Internal server error' });
+        }
+
+      default:
+        return createResponse(405, { error: 'Method not allowed' });
     }
-    
-    return createResponse(405, { error: 'Method not allowed' });
-    
   } catch (error) {
-    console.error('Error:', error);
-    
-    if (error instanceof Error && error.message === 'Invalid role') {
-      return createResponse(403, { error: 'Invalid role' });
-    }
-    
-    return createResponse(500, { 
-      error: 'Internal server error',
-      message: error instanceof Error ? error.message : 'Unknown error'
-    });
+    console.error('Unexpected error:', error);
+    return createResponse(500, { error: 'Internal server error' });
   }
 };
