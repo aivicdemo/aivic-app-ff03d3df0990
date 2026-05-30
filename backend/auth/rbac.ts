@@ -17,9 +17,6 @@ export function hasPermission(role: Role, action: 'read' | 'write' | 'delete'): 
   return permission[action];
 }
 
-export function validateRole(role: string): Role {
-  if (!['admin', 'operator', 'viewer'].includes(role)) {
-    throw new Error('Invalid role');
-  }
-  return role as Role;
+export function validateRole(role: string): role is Role {
+  return ['admin', 'operator', 'viewer'].includes(role);
 }
