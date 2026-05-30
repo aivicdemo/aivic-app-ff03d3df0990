@@ -13,10 +13,13 @@ export const ROLE_PERMISSIONS: Record<Role, Permission> = {
 };
 
 export function hasPermission(role: Role, action: 'read' | 'write' | 'delete'): boolean {
-  const permissions = ROLE_PERMISSIONS[role];
-  return permissions[action];
+  const permission = ROLE_PERMISSIONS[role];
+  return permission[action];
 }
 
-export function validateRole(role: string): role is Role {
-  return ['admin', 'operator', 'viewer'].includes(role);
+export function validateRole(role: string): Role {
+  if (!['admin', 'operator', 'viewer'].includes(role)) {
+    throw new Error('Invalid role');
+  }
+  return role as Role;
 }
