@@ -1,5 +1,5 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, ScanCommand, GetCommand, PutCommand, DeleteCommand, UpdateCommand, BatchWriteCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, ScanCommand, GetCommand, PutCommand, UpdateCommand, DeleteCommand, BatchWriteCommand } from '@aws-sdk/lib-dynamodb';
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { hasPermission, validateRole, Role } from './rbac';
 import * as crypto from 'crypto';
@@ -38,7 +38,7 @@ function createResponse(statusCode: number, body: any): APIGatewayProxyResult {
 }
 
 async function createAuditLog(userId: string, action: string, details: any) {
-  const auditLog = {
+  const auditItem = {
     pk: 'AUDIT',
     sk: `${Date.now()}_${crypto.randomUUID()}`,
     userId,
@@ -49,7 +49,7 @@ async function createAuditLog(userId: string, action: string, details: any) {
   
   await docClient.send(new PutCommand({
     TableName: TABLE_NAME,
-    Item: auditLog
+    Item: auditItem
   }));
 }
 
@@ -129,21 +129,21 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
       for (const chunk of chunks) {
         const writeRequests = chunk.map(item => {
+          const id = item.id || crypto.randomUUID();
           const now = new Date().toISOString();
-          const enrichedItem = {
-            ...item,
-            pk: tableConfig.pk,
-            sk: item.id || crypto.randomUUID(),
-            id: item.id || crypto.randomUUID(),
-            createdAt: now,
-            updatedAt: now,
-            createdBy: auth.userId,
-            updatedBy: auth.userId
-          };
-
+          
           return {
             PutRequest: {
-              Item: enrichedItem
+              Item: {
+                pk: tableConfig.pk,
+                sk: id,
+                id,
+                createdAt: now,
+                updatedAt: now,
+                createdBy: auth.userId,
+                updatedBy: auth.userId,
+                ...item
+              }
             }
           };
         });
@@ -162,8 +162,7 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       }
 
       await createAuditLog(auth.userId, 'BULK_IMPORT', {
-        tableIndex,
-        tableName: tableConfig.name,
+        table: tableConfig.name,
         imported,
         failed
       });
@@ -193,18 +192,18 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       }
 
       const body = JSON.parse(event.body || '{}');
-      const now = new Date().toISOString();
       const id = crypto.randomUUID();
+      const now = new Date().toISOString();
       
       const item = {
-        ...body,
         pk: tableConfig.pk,
         sk: id,
         id,
         createdAt: now,
         updatedAt: now,
         createdBy: auth.userId,
-        updatedBy: auth.userId
+        updatedBy: auth.userId,
+        ...body
       };
 
       await docClient.send(new PutCommand({
@@ -213,8 +212,7 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       }));
 
       await createAuditLog(auth.userId, 'CREATE', {
-        tableIndex,
-        tableName: tableConfig.name,
+        table: tableConfig.name,
         itemId: id
       });
 
@@ -249,27 +247,39 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       const body = JSON.parse(event.body || '{}');
       const now = new Date().toISOString();
       
-      const item = {
-        ...body,
-        pk: tableConfig.pk,
-        sk: itemId,
-        id: itemId,
-        updatedAt: now,
-        updatedBy: auth.userId
+      const updateExpression = 'SET updatedAt = :updatedAt, updatedBy = :updatedBy';
+      const expressionAttributeValues: any = {
+        ':updatedAt': now,
+        ':updatedBy': auth.userId
       };
+      
+      let updateExpressionParts = ['updatedAt = :updatedAt', 'updatedBy = :updatedBy'];
+      
+      Object.keys(body).forEach((key, index) => {
+        if (key !== 'pk' && key !== 'sk' && key !== 'id' && key !== 'createdAt' && key !== 'createdBy') {
+          const attrKey = `:val${index}`;
+          updateExpressionParts.push(`${key} = ${attrKey}`);
+          expressionAttributeValues[attrKey] = body[key];
+        }
+      });
 
-      await docClient.send(new PutCommand({
+      await docClient.send(new UpdateCommand({
         TableName: TABLE_NAME,
-        Item: item
+        Key: {
+          pk: tableConfig.pk,
+          sk: itemId
+        },
+        UpdateExpression: `SET ${updateExpressionParts.join(', ')}`,
+        ExpressionAttributeValues: expressionAttributeValues,
+        ReturnValues: 'ALL_NEW'
       }));
 
       await createAuditLog(auth.userId, 'UPDATE', {
-        tableIndex,
-        tableName: tableConfig.name,
+        table: tableConfig.name,
         itemId
       });
 
-      return createResponse(200, item);
+      return createResponse(200, { message: 'Updated successfully' });
     }
 
     if (itemId && method === 'DELETE') {
@@ -286,12 +296,11 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       }));
 
       await createAuditLog(auth.userId, 'DELETE', {
-        tableIndex,
-        tableName: tableConfig.name,
+        table: tableConfig.name,
         itemId
       });
 
-      return createResponse(200, { message: 'Item deleted successfully' });
+      return createResponse(200, { message: 'Deleted successfully' });
     }
 
     return createResponse(404, { error: 'Not found' });
