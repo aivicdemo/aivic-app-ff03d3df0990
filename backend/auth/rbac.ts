@@ -5,7 +5,7 @@ export interface Permission {
   action: 'create' | 'read' | 'update' | 'delete' | 'bulk';
 }
 
-const rolePermissions: Record<Role, Permission[]> = {
+const ROLE_PERMISSIONS: Record<Role, Permission[]> = {
   admin: [
     { resource: '*', action: 'create' },
     { resource: '*', action: 'read' },
@@ -25,13 +25,13 @@ const rolePermissions: Record<Role, Permission[]> = {
 };
 
 export function hasPermission(role: Role, resource: string, action: Permission['action']): boolean {
-  const permissions = rolePermissions[role] || [];
+  const permissions = ROLE_PERMISSIONS[role] || [];
   return permissions.some(p => 
     (p.resource === '*' || p.resource === resource) && p.action === action
   );
 }
 
-export function extractUserRole(event: any): Role {
+export function extractRoleFromEvent(event: any): Role {
   const authHeader = event.headers?.Authorization || event.headers?.authorization;
   if (!authHeader) return 'viewer';
   
